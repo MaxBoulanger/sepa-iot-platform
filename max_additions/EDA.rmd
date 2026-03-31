@@ -1,0 +1,467 @@
+---
+title: "Untitled"
+output: github_document
+---
+
+```{r setup}
+install.packages("dplyr")
+install.packages("ggplot2")
+install.packages("tidyr")
+install.packages("lubridate")
+install.packages("forecast")
+install.packages("INLA", repos = "https://inla.r-inla-download.org/R/stable")
+install.packages("mgcv")
+install.packages("ggcorrplot")
+install.packages("heatmaply")
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(lubridate)
+library(forecast)
+library(fmesher)
+library(INLA)
+library(mgcv)
+library(rlang)
+library(zoo)
+library(ggcorrplot)
+library(heatmaply)
+```
+
+# Droplet Data
+
+```{r setup, include=FALSE}
+# Load Droplet data
+df <- read.csv("data/Droplet_2_70B3D5499AFA2DEE_365days.csv")
+head(df)
+summary(df)
+```
+
+## EDA
+
+```{r}
+# Keep only relevant columns
+df <- df[, -c(2, 3, 4, 5, 6, 7, 8, 11, 13, 15)]
+head(df)
+summary(df)
+```
+
+```{r}
+# Check unique values in each relevant column
+df %>% count(air_temp)
+```
+
+```{r}
+df %>% count(air_pressure)
+```
+
+```{r}
+df %>% count(battery_volt)
+```
+
+```{r}
+df %>% count(rainfall)
+```
+
+```{r}
+# Convert timestamps and extract time features
+df$timestamp <- ymd_hms(df$timestamp, tz = "UTC")
+
+df$hour <- hour(df$timestamp)
+df$weekday <- wday(df$timestamp, label = TRUE, abbr = FALSE)
+df$week <- isoweek(df$timestamp)
+df$month <- month(df$timestamp, label = TRUE, abbr = TRUE)
+df$year <- year(df$timestamp)
+
+df$hour <- as.factor(df$hour)
+df$weekday <- as.factor(df$weekday)
+df$month <- as.factor(df$month)
+```
+
+```{r}
+# Visualise air temperature across time and its distribution
+hist(df$air_temp)
+```
+
+```{r}
+plot(df$timestamp, df$air_temp,
+     type = "l", xlab = "Time", ylab = "Air Temperature (°C)")
+```
+
+```{r}
+plot(df$timestamp[2000:3000], df$air_temp[2000:3000],
+     type = "l", xlab = "Time", ylab = "Air Temperature (°C)")
+```
+
+## Bayesian Modelling with INLA
+
+```{r}
+# Create time index
+df$time_idx <- seq_len(nrow(df))
+```
+
+```{r}
+# INLA (Integrated Nested Laplace Approximation) model with RW1 and covariates
+formula_baseline <- air_temp ~ f(time_idx, model = "rw1") + hour + month
+
+result_baseline <- inla(formula_baseline,
+                        data = df,
+                        family = "gaussian",
+                        control.predictor = list(compute = TRUE),
+                        control.compute = list(dic = TRUE, waic = TRUE))
+
+summary(result_baseline)
+```
+
+```{r}
+# INLA (Integrated Nested Laplace Approximation) model with AR1 and covariates
+formula_ar <- air_temp ~ 1 + f(time_idx, model = "ar1")
+
+result_ar <- inla(formula_ar,
+                  data = df,
+                  family = "gaussian",
+                  control.predictor = list(compute = TRUE),
+                  control.compute = list(dic = TRUE, waic = TRUE))
+
+summary(result_ar)
+```
+
+```{r}
+# INLA (Integrated Nested Laplace Approximation) model with RW1
+formula_rw <- air_temp ~ 1 + f(time_idx, model = "rw1")
+
+result_rw <- inla(formula_rw,
+                  data = df,
+                  family = "gaussian",
+                  control.predictor = list(compute = TRUE),
+                  control.compute = list(dic = TRUE, waic = TRUE))
+
+summary(result_rw)
+```
+
+# Hydroranger Data
+
+## EDA
+
+```{r}
+# Load Hydroranger data
+hydroranger_df <- read.csv("data/HYDRORANGER_0002_F863663062793691_365days.csv")
+
+summary(hydroranger_df)
+head(hydroranger_df)
+```
+
+```{r}
+# Keep only relevant columns
+hydroranger_df <- hydroranger_df[, -c(2, 3, 4, 5, 6, 7, 8, 9, 10)]
+
+summary(hydroranger_df)
+head(hydroranger_df)
+```
+
+```{r}
+# Visualise water level distribution
+hist(hydroranger_df$water_level_avg)
+```
+
+```{r}
+# Identify missing timestamps
+hydroranger_df$timestamp <- as.POSIXct(hydroranger_df$timestamp, tz = "UTC")
+
+full_seq <- data.frame(
+  timestamp = seq(
+    from = min(hydroranger_df$timestamp),
+    to = max(hydroranger_df$timestamp),
+    by = "15 min"
+  )
+)
+attr(full_seq$timestamp, "tzone") <- "UTC"
+
+missing <- anti_join(full_seq, hydroranger_df, by = "timestamp")
+
+ggplot(missing, aes(x = timestamp)) +
+  geom_histogram() +
+  labs(title = "Missing timestamps per hour")
+```
+
+```{r}
+# Create complete dataset with missing flag
+df_full <- full_seq %>%
+  left_join(hydroranger_df, by = "timestamp") %>%
+  mutate(missing = ifelse(is.na(water_level_avg), 1, 0))
+
+df_full <- df_full %>%
+  mutate(hour = hour(timestamp),
+         date = as.Date(timestamp))
+```
+
+```{r}
+# Visualise missing data against air temperature
+ggplot(df_full, aes(x = timestamp)) +
+  geom_line(aes(y = air_temp), colour = "blue", alpha = 0.7) +
+  geom_point(data = df_full %>% filter(missing == 1),
+             aes(y = 0), colour = "red", size = 1.5) +
+  labs(title = "Missing timestamps (red) vs Air temperature over time",
+       y = "Air temperature (°C)", x = "Time") +
+  theme_minimal()
+```
+
+```{r}
+# Analyse weather conditions before data gaps to identify patterns
+df_full <- df_full %>%
+  arrange(timestamp) %>%
+  mutate(missing_shift = lag(missing, default = 0),
+         gap_start = (missing == 1 & missing_shift == 0))
+
+gap_context <- df_full %>%
+  filter(gap_start) %>%
+  left_join(
+    df_full %>%
+      mutate(timestamp_next = lead(timestamp)) %>%
+      select(timestamp_next, air_temp_prev = air_temp,
+             air_humidity_prev = air_humidity),
+    by = c("timestamp" = "timestamp_next")
+  )
+
+ggplot(gap_context, aes(x = air_temp_prev)) +
+  geom_histogram(bins = 20, fill = "steelblue") +
+  labs(title = "Air temperature before data gaps",
+       x = "Air temperature (°C)", y = "Count")
+```
+
+
+```{r}
+# Function to plot histogram of variable before data gaps to identify patterns
+plot_gap_hist <- function(df_full, var, bins = 20) {
+  var <- ensym(var)
+
+  df_full <- df_full %>%
+    arrange(timestamp) %>%
+    mutate(missing_shift = lag(missing, default = 0),
+           gap_start = (missing == 1 & missing_shift == 0))
+
+  gap_context <- df_full %>%
+    filter(gap_start) %>%
+    left_join(
+      df_full %>%
+        mutate(timestamp_next = lead(timestamp)) %>%
+        select(timestamp_next, prev_value = !!var),
+      by = c("timestamp" = "timestamp_next")
+    )
+
+  ggplot(gap_context, aes(x = prev_value)) +
+    geom_histogram(bins = bins, fill = "steelblue", color = "white") +
+    labs(
+      title = paste("Distribution of", as_string(var), "before data gaps"),
+      x = paste(as_string(var), "before gap"),
+      y = "Count"
+    ) +
+    theme_minimal()
+}
+```
+
+```{r}
+plot_gap_hist(df_full, "water_level_avg")
+```
+
+```{r}
+# Identify outliers in water level data
+find_outliers <- function(x) {
+  Q1 <- quantile(x, 0.25, na.rm = TRUE)
+  Q3 <- quantile(x, 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  lower <- Q1 - 1.5 * IQR_val
+  upper <- Q3 + 1.5 * IQR_val
+  outliers <- which(x < lower | x > upper)
+  return (outliers)
+}
+
+outlier_idx <- find_outliers(df_full$water_level_avg)
+df_full[outlier_idx, c("timestamp", "water_level_avg")]
+```
+
+```{r}
+# Plot water level time series with outliers
+plot(df_full$timestamp, df_full$water_level_avg, type = "l",
+     xlab = "Time", ylab = "Water Level")
+```
+
+```{r}
+# Highlight negative water level values
+low_vals <- df_full %>%
+  filter(water_level_avg < 0) %>%
+  select(timestamp, water_level_avg)
+
+ggplot(df_full, aes(x = timestamp, y = water_level_avg)) +
+  geom_line() +
+  geom_point(data = low_vals, aes(x = timestamp, y = water_level_avg),
+             color = "red") +
+  labs(title = "Water level with high values highlighted")
+```
+
+```{r}
+# Fix negative water level values by interpolation
+df_fixed <- df_full %>%
+  arrange(timestamp) %>%
+  mutate(
+    water_level_avg = ifelse(water_level_avg < 0, NA, water_level_avg),
+    water_level_avg = na.approx(water_level_avg, x = timestamp, na.rm = FALSE)
+  )
+```
+
+```{r}
+# Plot interpolated water level time series
+plot(df_fixed$timestamp, df_fixed$water_level_avg, type = "l",
+     xlab = "Time", ylab = "Water Level")
+```
+
+```{r}
+# Highlight high water level values
+high_vals <- df_fixed %>%
+  filter(water_level_avg > 300) %>%
+  select(timestamp, water_level_avg)
+
+ggplot(df_fixed, aes(x = timestamp, y = water_level_avg)) +
+  geom_line() +
+  geom_point(data = high_vals, aes(x = timestamp, y = water_level_avg),
+             color = "red") +
+  labs(title = "Water level with high values highlighted")
+```
+
+```{r}
+# Fix anormaly high water level values by interpolation
+df_fixed <- df_fixed %>%
+  arrange(timestamp) %>%
+  mutate(
+    water_level_avg = ifelse(water_level_avg > 2000, NA, water_level_avg),
+    water_level_avg = na.approx(water_level_avg, x = timestamp, na.rm = FALSE)
+  )
+```
+
+```{r}
+# Plot final cleaned water level time series
+plot(df_fixed$timestamp, df_fixed$water_level_avg, type = "l",
+     xlab = "Time", ylab = "Water Level")
+```
+
+```{r}
+plot(df_fixed$timestamp[2850:2950], df_fixed$water_level_avg[2850:2950],
+     type = "l", xlab = "Time", ylab = "Water Level")
+```
+
+```{r}
+plot(df_fixed$timestamp[2600:3272], df_fixed$water_level_avg[2600:3272],
+     type = "l", xlab = "Time", ylab = "Water Level")
+```
+
+```{r}
+plot(df_fixed$timestamp[2600:5480], df_fixed$water_level_avg[2600:5480],
+     type = "l", xlab = "Time", ylab = "Water Level")
+```
+
+```{r}
+#NEXT STEPS COULD BE TO FILL IN MISSING DATA USING PREVIOUS VALUES
+
+# Select only numeric columns
+numeric_df <- df_fixed %>%
+  select(where(is.numeric))
+
+# Compute correlation matrix (use pairwise to handle missing data)
+cor_matrix <- cor(numeric_df, use = "pairwise.complete.obs")
+
+ggcorrplot(cor_matrix,
+           method = "square",
+           type = "lower",
+           lab = TRUE,
+           lab_size = 2.5,
+           title = "Feature Correlation Heatmap",
+           colors = c("steelblue", "white", "darkred"))
+```
+
+```{r}
+# Interactive correlation heatmap
+heatmaply_cor(
+  cor_matrix,
+  xlab = "Features",
+  ylab = "Features",
+  main = "Interactive Correlation Heatmap",
+  colors = colorRampPalette(c("steelblue", "white", "darkred"))(256)
+)
+```
+
+## Modelling
+### GAMs
+
+```{r}
+# Prepare time data for GAM modelling
+hydroranger_modelling <- df_fixed %>%
+  mutate(
+    month = as.numeric(format(timestamp, "%m")),
+    week  = as.numeric(format(timestamp, "%U")) + 1,
+    hour  = as.numeric(format(timestamp, "%H")) +
+      as.numeric(format(timestamp, "%M")) / 60,
+    weekday = wday(timestamp, label = TRUE, week_start = 1),
+    hour_of_week = (as.numeric(weekday) - 1) * 24 + hour
+  )
+```
+
+```{r}
+# Baseline GAM model for water level prediction
+knots_baseline <- list(hour = c(0.5, 24.5), week = c(0.5, 52.5),
+                       month = c(0.5, 12.5))
+
+water_level_model_baseline <- bam(formula = water_level_avg ~
+                                    s(air_temp, k = 200, bs = "cr") +
+                                      s(air_humidity, k = 200, bs = "cr") +
+                                      s(hour, k = 10, bs = "cc") +
+                                      s(week, k = 20, bs = "cc") +
+                                      s(month, k = 12, bs = "cc"),
+                                  family = gaussian(),
+                                  data = hydroranger_modelling,
+                                  knots = knots_baseline,
+                                  discrete = TRUE,
+                                  select = TRUE)
+
+summary(water_level_model_baseline)
+plot(water_level_model_baseline, scheme = 2, pages = 1)
+```
+
+```{r}
+gam.check(water_level_model_baseline)
+```
+
+```{r}
+# Enhanced GAM model with interaction term
+knots_model <- list(hour = c(0.5, 24.5), week = c(0.5, 52.5),
+                    month = c(0.5, 12.5), hour_of_week = c(0.5, 168.5))
+
+water_level_model <- bam(formula = water_level_avg ~
+                           s(air_temp, k = 200, bs = "cr") +
+                             s(air_humidity, k = 200, bs = "cr") +
+                             s(hour, k = 10, bs = "cc") +
+                             s(hour_of_week, k = 200, bs = "cc") +
+                             s(week, k = 20, bs = "cc") +
+                             s(month, k = 12, bs = "cc") +
+                             ti(hour, air_temp, bs = c("cc", "cr")),
+                         family = gaussian(),
+                         data = hydroranger_modelling,
+                         knots = knots_model,
+                         discrete = TRUE,
+                         select = TRUE)
+```
+
+
+```{r}
+gam.check(water_level_model)
+```
+
+```{r}
+summary(water_level_model)
+```
+
+```{r}
+plot(water_level_model, scheme = 2, pages = 1)
+```
+

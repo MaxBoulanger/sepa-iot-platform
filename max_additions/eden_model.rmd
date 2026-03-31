@@ -1,0 +1,1190 @@
+---
+title: "Untitled"
+output: github_document
+---
+# Load Libraries and Data
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(lubridate)
+library(forecast)
+library(fmesher)
+library(INLA)
+library(mgcv)
+library(rlang)
+library(zoo)
+library(ggcorrplot)
+library(heatmaply)
+library(Metrics)
+library(gt)
+library(tidyverse)
+```
+
+```{r}
+df <- read.csv("data2/final_dataset.csv")
+summary(df)
+```
+
+# Data Preprocessing
+
+```{r}
+# Visualise Soil Moisture Distribution
+hist(df$soil_moisture, breaks = 30, main = "Hisogram of Soil Moisture",
+     xlab = "Soil Moisture")
+```
+
+```{r}
+# Visualise Rainfall Distribution
+hist(df$water_level_avg, breaks = 30, main = "Hisogram of Water Level",
+     xlab = "Rainfall")
+
+plot(df$water_level_avg)
+```
+
+```{r}
+# Visualise Air Temperature Distribution
+hist(df$air_temp, breaks = 30, main = "Hisogram of Air Temperature",
+     xlab = "Air Temperature")
+
+plot(df$air_humidity)
+```
+
+```{r}
+# Handle outliers and missing data
+df <- df %>%
+  mutate(
+    water_level_avg = ifelse(water_level_avg > 1000, NA, water_level_avg),
+    water_level_avg = zoo::na.locf(water_level_avg, na.rm = FALSE)
+  )
+  ```
+
+```{r}
+# Prepare time data for GAM modelling
+model_df <- df %>%
+  mutate(timestamp = as.POSIXct(df$timestamp, tz = "UTC"),
+    month = as.numeric(format(timestamp, "%m")),
+    week  = as.numeric(format(timestamp, "%U")),
+    hour  = as.numeric(format(timestamp, "%H")) +
+      as.numeric(format(timestamp, "%M")) / 60,
+    weekday = wday(timestamp, label = TRUE, week_start = 1),
+    hour_of_week = (as.numeric(weekday) - 1) * 24 + hour
+  )
+```
+
+```{r}
+# Check for autocorrelation in Soil Moisture
+lag_df <- model_df %>% arrange(timestamp)
+
+sm <- na.omit(lag_df$soil_moisture)
+
+# Plot ACF and PACF
+ggAcf(sm, lag.max = 96) + ggtitle("ACF of soil_moisture")
+ggPacf(sm, lag.max = 96) + ggtitle("PACF of soil_moisture")
+```
+
+```{r}
+# plot ACF and PACF
+ggAcf(lag_df$water_level_avg, lag.max = 96) + ggtitle("ACF of soil_moisture")
+ggPacf(lag_df$water_level_avg, lag.max = 96) + ggtitle("PACF of soil_moisture")
+```
+
+```{r}
+# Create a function to generate Lags and Rolling Means
+make_lags <- function(df, lags = c(1,2,4,8,96), roll_windows = c(3,4,24)) {
+  df <- df %>% arrange(timestamp)
+  for (L in lags) {
+    df <- df %>% mutate(!!paste0("sm_lag", L) := lag(soil_moisture, L))
+  }
+  for (W in roll_windows) {
+    # rollmean of previous W points (not including current)
+    df <- df %>% mutate(!!paste0("sm_roll", W) := zoo::rollapply(lag(soil_moisture), 
+                                                                 width = W, FUN = mean, 
+                                                                 fill = NA, align = "right"))
+  }
+  return(df)
+}
+```
+
+```{r}
+training_df <- model_df %>%
+  slice(1:max(0, n() - 96*7))
+
+df_test <- model_df %>%
+  tail(96*7)
+
+# Apply lag function to Training Data
+training_df <- make_lags(training_df,
+                           lags = c(1, 2, 4, 16, 96))
+
+df_test_lags <- make_lags(df_test,
+                           lags = c(1, 2, 4, 16, 96))
+
+df_test_lags <- df_test_lags %>% drop_na()
+training_df <- training_df %>% drop_na()
+```
+
+# Fit GAM Models
+## Baseline Model
+
+```{r}
+# Define Knots for Cyclic Splines
+knots <- list(hour = c(0.5, 24.5), week = c(0.5, 53.5),
+              month = c(0.5, 12.5), hour_of_week = c(0.5, 168.5))
+```
+
+```{r}
+# Baseline GAM Model with most Features as Predictors
+soil_moisture_baseline <- bam(formula = soil_moisture ~
+                             s(water_level_avg, k = 55, bs = "cr") +
+                               s(air_temp, k = 30, bs = "cr") +
+                               s(air_humidity, k = 50, bs = "cr") +
+                               s(hour, k = 25, bs = "cc") +
+                              #  s(hour_of_week, k = 10, bs = "cc") +
+                              #  s(week, k = 53, bs = "cc") +
+                               s(month, k = 13, bs = "cc"),
+                              #  ti(hour, water_level_avg, k = c(20, 30),
+                                  # bs = c("cc", "cr")),
+                           family = gaussian(),
+                           data = training_df,
+                           knots = knots,
+                           discrete = TRUE,
+                           select = TRUE)
+```
+
+```{r}
+gam.check(soil_moisture_baseline)
+```
+
+```{r}
+summary(soil_moisture_baseline)
+plot(soil_moisture_baseline, scheme = 2, pages = 1)
+```
+
+## Improved Models
+
+```{r}
+# Model that turned out to be Overfitted with Interractions
+soil_moisture_model_overfitted <- bam(formula = soil_moisture ~
+                                        s(air_temp, k = 30, bs = "cr") +
+                               s(water_level_avg, k = 25, bs = "cr") +
+                               s(week, k = 53, bs = "cc") +
+                               s(month, k = 13, bs = "cc") +
+                               s(hour_of_week, k = 100, bs = "cc") +
+                               ti(water_level_avg, week, k = c(20, 30),
+                                  bs = c("cr", "cc")) +
+                               ti(air_temp, hour_of_week, k = c(20, 30),
+                                  bs = c("cr", "cc")) +
+                               ti(hour_of_week, week, k = c(20, 30),
+                                  bs = c("cc", "cc")),
+                           family = gaussian(),
+                           data = training_df,
+                           knots = knots,
+                           discrete = TRUE,
+                           select = TRUE)
+```
+
+```{r}
+summary(soil_moisture_model_overfitted)
+plot(soil_moisture_model_overfitted, scheme = 2, pages = 2)
+```
+
+```{r}
+gam.check(soil_moisture_model_overfitted)
+```
+
+```{r}
+# Improved Model without Lags
+soil_moisture_model_improved <- bam(soil_moisture ~
+    s(air_temp, k = 50, bs = "cr") +
+    s(water_level_avg, k = 25, bs = "cr") +
+    s(hour, k = 30, bs = "cc") +
+    s(week, k = 52, bs = "cc") +
+    ti(air_temp, hour, k = c(15, 20), bs = c("cr", "cc")) +
+    ti(hour, water_level_avg, k = c(15, 5), bs = c("cc", "cr")) +
+    ti(hour, week, k = c(15, 15), bs = c("cc", "cc")),
+  family = gaussian(),
+  data = training_df,
+  knots = knots,
+  discrete = TRUE,
+  select = TRUE
+)
+```
+
+```{r}
+summary(soil_moisture_model_improved)
+plot(soil_moisture_model_improved, scheme = 2, pages = 1)
+```
+
+```{r}
+gam.check(soil_moisture_model_improved)
+```
+
+## Lag Models 
+
+```{r}
+# Model with different Lags to compare Performance
+soil_moisture_model_lag4 <- bam(soil_moisture ~
+    # Main effects
+    s(air_temp, k = 20, bs = "cr") +
+    s(water_level_avg, k = 25, bs = "cr") +
+    # Cyclic patterns
+    s(hour, k = 30, bs = "cc") +
+    s(week, k = 20, bs = "cc") +
+    s(month, k = 13, bs = "cc") +
+    # Lags and Rolling Means
+    s(sm_lag4, k = 5, bs = "cr") +
+    # Interactions (reduced to only the useful ones)
+    ti(air_temp, hour, k = c(15, 20),
+       bs = c("cr", "cc")) +
+    ti(hour, week, k = c(15, 15),
+       bs = c("cc", "cc")),
+  family = gaussian(),
+  data = training_df,
+  knots = knots,
+  discrete = TRUE,
+  select = TRUE
+)
+```
+
+```{r}
+soil_moisture_model_lag16 <- bam(soil_moisture ~
+    # Main effects
+    s(air_temp, k = 20, bs = "cr") +
+    s(water_level_avg, k = 25, bs = "cr") +
+    # Cyclic patterns
+    s(hour, k = 30, bs = "cc") +
+    s(week, k = 20, bs = "cc") +
+    s(month, k = 13, bs = "cc") +
+    # Lags and Rolling Means
+    s(sm_lag16, k = 5, bs = "cr") +
+    # Interactions (reduced to only the useful ones)
+    ti(air_temp, hour, k = c(15, 20),
+       bs = c("cr", "cc")) +
+    ti(hour, week, k = c(15, 15),
+       bs = c("cc", "cc")),
+  family = gaussian(),
+  data = training_df,
+  knots = knots,
+  discrete = TRUE,
+  select = TRUE
+)
+```
+
+```{r}
+soil_moisture_model_lag1 <- bam(soil_moisture ~
+    # Main effects
+    s(air_temp, k = 20, bs = "cr") +
+    s(water_level_avg, k = 25, bs = "cr") +
+    # Cyclic patterns
+    s(hour, k = 30, bs = "cc") +
+    s(week, k = 20, bs = "cc") +
+    s(month, k = 13, bs = "cc") +
+    # Lags and Rolling Means
+    s(sm_lag1, k = 5, bs = "cr") +
+    # Interactions (reduced to only the useful ones)
+    ti(air_temp, hour, k = c(15, 20),
+       bs = c("cr", "cc")) +
+    ti(hour, week, k = c(15, 15),
+       bs = c("cc", "cc")),
+  family = gaussian(),
+  data = training_df,
+  knots = knots,
+  discrete = TRUE,
+  select = TRUE
+)
+```
+
+```{r}
+soil_moisture_model_lag96 <- bam(soil_moisture ~
+    # Main effects
+    s(air_temp, k = 20, bs = "cr") +
+    s(water_level_avg, k = 25, bs = "cr") +
+    # Cyclic patterns
+    s(hour, k = 30, bs = "cc") +
+    s(week, k = 20, bs = "cc") +
+    s(month, k = 13, bs = "cc") +
+    # Lags and Rolling Means
+    s(sm_lag96, k = 5, bs = "cr") +
+    # Interactions (reduced to only the useful ones)
+    ti(air_temp, hour, k = c(15, 20),
+       bs = c("cr", "cc")) +
+    ti(hour, week, k = c(15, 15),
+       bs = c("cc", "cc")),
+  family = gaussian(),
+  data = training_df,
+  knots = knots,
+  discrete = TRUE,
+  select = TRUE
+)
+```
+
+```{r}
+# Checking Best Lag Model Fit
+summary(soil_moisture_model_lag1)
+```
+
+```{r}
+plot(soil_moisture_model_lag1, scheme = 2, pages = 1)
+```
+
+```{r}
+gam.check(soil_moisture_model_lag1)
+```
+
+# Evaluate Model Predictions
+## Functions for CI Computation
+
+```{r}
+# Function to compute Confidence Intervals using posterior simulation
+ci_pred <- function(model, data, n = 1000) {
+
+  # 1. Keep only rows with complete predictors
+  data_complete <- data[complete.cases(predict(model, data, type = "lpmatrix")), ]
+
+  # 2. Recompute the prediction matrix on clean data
+  Xp <- predict(model, data_complete, type = "lpmatrix")
+
+  beta <- coef(model)
+  Vb <- vcov(model)
+
+  br <- rmvn(n, beta, Vb)
+  a.range <- numeric(n)
+
+  for (i in 1:n) {
+    pred.a <- Xp %*% br[i, ]
+    a.range[i] <- mean(pred.a)
+  }
+
+  ci <- quantile(a.range, c(.025, .975))
+  mean_estimate <- mean(a.range)
+
+  list(
+    confidence_interval = ci,
+    mean_estimate = mean_estimate,
+    n_rows_used = nrow(data_complete)
+  )
+}
+```
+
+```{r}
+# Subset data for group-wise CI
+compute_ci_by_group <- function(model, data, group_var, n = 1000) {
+
+  group_sym <- rlang::ensym(group_var)
+
+  # Extract variables used by the model
+  model_vars <- all.vars(formula(model))
+
+  # Remove groups where required variables are fully missing
+  clean_data <- data %>% dplyr::filter(!if_any(all_of(model_vars), is.na))
+
+  groups <- unique(dplyr::pull(clean_data, !!group_sym))
+
+  results <- list()
+
+  for (g in groups) {
+    subset_data <- clean_data %>% dplyr::filter(!!group_sym == g)
+
+    # Skip if subset is empty (no complete data)
+    if (nrow(subset_data) == 0) next
+
+    # Compute CI
+    ci_results <- try(ci_pred(model, subset_data, n = n), silent = TRUE)
+
+    if (inherits(ci_results, "try-error")) next
+
+    results[[as.character(g)]] <- tibble::tibble(
+      group = g,
+      lower = ci_results$confidence_interval[1],
+      mean  = ci_results$mean_estimate,
+      upper = ci_results$confidence_interval[2]
+    )
+  }
+
+  dplyr::bind_rows(results)
+}
+
+plot_ci_by_group <- function(results_df, group_label = "Group") {
+  ggplot(results_df, aes(x = group, y = mean)) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+    labs(
+      title = paste("Predicted Soil Moisture CI by", group_label),
+      x = group_label,
+      y = "Predicted Soil Moisture"
+    ) +
+    theme_minimal()+
+    theme(
+      plot.title = element_text(size = 22, hjust = 0.5))
+}
+```
+
+## Test Data
+
+
+```{r}
+# Function to evaluate non-lag model predictions
+evaluate_model <- function(model, df_test) {
+  
+  # Remove rows with missing target
+  df_clean <- df_test |> tidyr::drop_na()
+  
+  # Predict with SE
+  preds <- predict.bam(model, df_clean, type = "response", se.fit = TRUE)
+  
+  df_eval <- df_clean %>%
+    mutate(
+      pred   = preds$fit,
+      se     = preds$se.fit,
+      lower  = pred - 1.96 * se,
+      upper  = pred + 1.96 * se
+    )
+  
+  # Metrics
+  rmse_val <- rmse(df_eval$soil_moisture, df_eval$pred)
+  mae_val  <- mae(df_eval$soil_moisture, df_eval$pred)
+  
+  # R² formula
+  r2_val <- 1 -
+    sum((df_eval$soil_moisture - df_eval$pred)^2) /
+    sum((df_eval$soil_moisture - mean(df_eval$soil_moisture))^2)
+  
+  list(
+    metrics = tibble(RMSE = rmse_val, MAE = mae_val, R2 = r2_val),
+    preds   = df_eval
+  )
+}
+```
+
+```{r}
+res_overfit_test     <- evaluate_model(soil_moisture_model_overfitted, df_test_lags)
+res_baseline_test   <- evaluate_model(soil_moisture_baseline, df_test_lags)
+res_overfit_train <- evaluate_model(soil_moisture_model_overfitted, training_df)
+res_baseline_train <- evaluate_model(soil_moisture_baseline, training_df)
+res_final_test <- evaluate_model(soil_moisture_model_improved, df_test_lags)
+res_final_train <- evaluate_model(soil_moisture_model_improved, training_df)
+
+results_test_overfit            <- res_overfit_test$metrics
+results_test_baseline   <- res_baseline_test$metrics
+results_train_overfit <- res_overfit_train$metrics
+results_train_baseline <- res_baseline_train$metrics
+results_test_final <- res_final_test$metrics
+results_train_final <- res_final_train$metrics
+```
+
+```{r}
+# Comparison of non-lag Models
+comparison <- bind_rows(
+  results_train_baseline  %>% mutate(Model = "Baseline - Train"),
+  results_test_baseline  %>% mutate(Model = "Baseline - Test"),
+  results_train_overfit    %>% mutate(Model = "Model Overfitted - Train"),
+  results_test_overfit    %>% mutate(Model = "Model Overfitted - Test"),
+  results_train_final  %>% mutate(Model = "Final Model - Train"),
+  results_test_final  %>% mutate(Model = "Final Model - Test")
+)
+
+comparison
+```
+
+```{r}
+df_pred_compare <- res_final_test$preds %>%
+  select(timestamp, soil_moisture,
+         pred_model2 = pred,
+         lower_model2 = lower,
+         upper_model2 = upper) %>%
+  left_join(
+    res_baseline_test$preds %>%
+      select(timestamp,
+             pred_baseline = pred,
+             lower_baseline = lower,
+             upper_baseline = upper),
+    by = "timestamp")
+```
+
+```{r}
+# Getting a graph comparing the baseline with non-lag Final Model
+ggplot(df_pred_compare, aes(x = timestamp)) +
+  
+  geom_ribbon(aes(ymin = lower_model2, ymax = upper_model2, fill = "Model Final CI"), alpha = 1) +
+  geom_ribbon(aes(ymin = lower_baseline, ymax = upper_baseline, fill = "Model Baseline CI"), alpha = 1) +
+  
+  geom_line(aes(y = soil_moisture, colour = "Observed"), linewidth = 0.9) +
+  geom_line(aes(y = pred_model2, colour = "Model Final Prediction"), linewidth = 0.9) +
+  geom_line(aes(y = pred_baseline, colour = "Model Baseline Prediction"), 
+            linewidth = 0.9, linetype = "dashed") +
+  
+  scale_colour_manual(values = c(
+    "Observed"             = "black",
+    "Model Final Prediction"   = "blue",
+    "Model Baseline Prediction"  = "red"
+  )) +
+  
+  scale_fill_manual(values = c(
+    "Model Final CI"     = "lightblue",
+    "Model Baseline CI"    = "pink"
+  )) +
+  
+  labs(
+    title = "Observed vs Predicted — Model Overfitted vs Final (With 95% CIs)",
+    y = "Soil Moisture",
+    x = "Time",
+    colour = "",
+    fill = ""
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Obtaining CIs for Hourly Predictions
+results_df_test <- compute_ci_by_group(
+  model = soil_moisture_model_improved,
+  data = df_test_lags,
+  group_var = hour,
+  n = 1000)
+
+results_df_test$hour <- results_df_test$group
+
+observed_by_hour_improved <- df_test_lags %>%
+  group_by(hour) %>%
+  summarise(
+    soil_moisture_mean = mean(soil_moisture, na.rm = TRUE)
+  )
+
+results_df_test <- results_df_test %>%
+  left_join(observed_by_hour_improved, by = "hour")
+```
+
+```{r}
+ggplot(results_df_test, aes(x = as.factor(hour))) +
+  
+  geom_point(aes(y = mean, colour = "Predicted"), size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, colour = "Predicted"),
+                width = 1) +
+  
+  geom_point(aes(y = soil_moisture_mean, colour = "Observed"),
+             size = 3) +
+  geom_line(aes(y = soil_moisture_mean, colour = "Observed", group = 1),
+            linewidth = 0.8) +
+  
+  scale_colour_manual(values = c(
+    "Predicted" = "blue",
+    "Observed"  = "black"
+  )) +
+  
+  labs(
+    title = "Predicted vs Observed Hourly Soil Moisture",
+    x = "Hour of the Day",
+    y = "Soil Moisture",
+    colour = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 22, hjust = 0.5),
+    axis.text.x = element_text(angle = 60, hjust = 1)
+  ) +
+  scale_y_continuous(labels = scales::comma)
+```
+
+```{r}
+# Obtaining CIs for Daily Predictions
+df_test_lags$date <- as.Date(df_test_lags$timestamp
+)
+results_df_test2 <- compute_ci_by_group(
+  model = soil_moisture_model_improved,
+  data = df_test_lags,
+  group_var = date,
+  n = 1000)
+
+results_df_test2$date <- as.Date(results_df_test2$group)
+
+observed_by_date_improved <- df_test_lags %>%
+  mutate(date = as.Date(timestamp)) %>%
+  group_by(date) %>%
+  summarise(
+    soil_moisture_mean = mean(soil_moisture, na.rm = TRUE)
+  )
+
+ci_plot_df_improved <- results_df_test2 %>%
+  left_join(observed_by_date_improved, by = "date")
+```
+
+```{r}
+ggplot(ci_plot_df_improved, aes(x = factor(date))) +
+  
+  geom_point(aes(y = mean, colour = "Predicted"), size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, colour = "Predicted"),
+                width = 0.2) +
+  
+  geom_point(aes(y = soil_moisture_mean, colour = "Observed"),
+             size = 3) +
+  geom_line(aes(y = soil_moisture_mean, colour = "Observed", group = 1),
+            linewidth = 0.8) +
+  
+  scale_colour_manual(values = c(
+    "Predicted" = "blue",
+    "Observed"  = "black"
+  )) +
+  
+  labs(
+    title = "Predicted vs Observed Daily Soil Moisture",
+    x = "Date",
+    y = "Soil Moisture",
+    colour = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 22, hjust = 0.5),
+    axis.text.x = element_text(angle = 60, hjust = 1)
+  ) +
+  scale_y_continuous(labels = scales::comma)
+```
+
+## Rolling Predictions
+
+```{r}
+merged_df <- make_lags(model_df,
+                           lags = c(1, 2, 4, 16, 96))
+```
+
+```{r}
+future_preds_df <- merged_df %>%
+  filter(timestamp > max(training_df$timestamp))
+```
+
+```{r}
+# Function which runs prediction for lag models, stores metrics across windows
+rolling_window_predict_with_metrics <- function(model, data, window_size = 16) {
+  
+  data <- data.frame(data)
+
+  # Storage for RMSE logs
+  rmse_results <- list()
+
+  # Detect the correct lag column automatically
+  lag_col <- paste0("sm_lag", window_size)
+  if (!lag_col %in% names(data)) {
+    stop(paste("Lag column", lag_col, "not found in data!"))
+  }
+  message("Using lag column: ", lag_col)
+  
+  # Prediction columns
+  data$preds <- NA
+  data$lower <- NA
+  data$upper <- NA
+  
+  n_rows <- nrow(data)
+  window_id <- 1
+  
+  for (i in seq(1, n_rows, by = window_size)) {
+    end_idx <- min(i + window_size - 1, n_rows)
+    window_data <- data %>% slice(i:end_idx)
+    
+    # Predict
+    preds <- predict.bam(model, newdata = window_data, type = "response", se.fit = TRUE)
+    pred <- preds$fit
+    se <- preds$se.fit
+    
+    data$preds[i:end_idx] <- pred
+    data$lower[i:end_idx] <- pred - 1.96 * se
+    data$upper[i:end_idx] <- pred + 1.96 * se
+
+    # ---------- WINDOW RMSE ----------
+    truth_window <- window_data$soil_moisture
+    rmse_window <- if (sum(!is.na(truth_window)) > 0) {
+      rmse(truth_window, pred)
+    } else {
+      NA
+    }
+    
+    # ---------- CUMULATIVE RMSE ----------
+    truth_cum <- data$soil_moisture[1:end_idx]
+    preds_cum <- data$preds[1:end_idx]
+
+    # Only valid if at least some predictions exist
+    valid_idx <- !is.na(truth_cum) & !is.na(preds_cum)
+    rmse_cum <- if (sum(valid_idx) > 0) {
+      rmse(truth_cum[valid_idx], preds_cum[valid_idx])
+    } else {
+      NA
+    }
+    # ---------- CUMULATIVE R-SQUARED ----------
+    r2_cum <- if (sum(valid_idx) > 0) {
+      # R² formula: 1 - (sum of squared residuals) / (total sum of squares)
+      ss_res <- sum((truth_cum[valid_idx] - preds_cum[valid_idx])^2)
+      ss_tot <- sum((truth_cum[valid_idx] - mean(truth_cum[valid_idx]))^2)
+      1 - (ss_res / ss_tot)
+    } else {
+      NA
+    }
+    
+    # ---------- Save metrics ----------
+    rmse_results[[window_id]] <- data.frame(
+      window_id = window_id,
+      start_idx = i,
+      end_idx = end_idx,
+      start_ts = window_data$timestamp[1],
+      end_ts = window_data$timestamp[nrow(window_data)],
+      rmse_window = rmse_window,
+      rmse_cumulative = rmse_cum,
+      r2_cumulative = r2_cum
+    )
+    
+    # ---------- Update lags ----------
+    next_window_start <- end_idx + 1
+    next_window_end <- min(next_window_start + window_size - 1, n_rows)
+    
+    if (next_window_start <= n_rows) {
+      n_assign <- min(length(pred), next_window_end - next_window_start + 1)
+      data[[lag_col]][next_window_start:(next_window_start + n_assign - 1)] <- pred[1:n_assign]
+    }
+    
+    window_id <- window_id + 1
+  }
+  
+  rmse_df <- bind_rows(rmse_results)
+  
+  return(list(
+    preds = data,
+    rmse_windows = rmse_df
+  ))
+}
+```
+
+```{r}
+# Running main function for every model
+results_predictions_rolling_1 <- rolling_window_predict_with_metrics(
+  soil_moisture_model_lag1,
+  future_preds_df,
+  window_size = 1
+)
+
+results_predictions_rolling_4 <- rolling_window_predict_with_metrics(
+  soil_moisture_model_lag4,
+  future_preds_df,
+  window_size = 4
+)
+
+results_predictions_rolling_16 <- rolling_window_predict_with_metrics(
+  soil_moisture_model_lag16,
+  future_preds_df,
+  window_size = 16
+)
+
+results_predictions_rolling_96 <- rolling_window_predict_with_metrics(
+  soil_moisture_model_lag96,
+  future_preds_df,
+  window_size = 96
+)
+
+results_prediction_baseline <- rolling_window_predict_with_metrics(
+  soil_moisture_baseline,
+  future_preds_df
+)
+
+results_prediction_overfitted <- rolling_window_predict_with_metrics(
+  soil_moisture_model_overfitted,
+  future_preds_df
+)
+
+results_prediction_improved <- rolling_window_predict_with_metrics(
+  soil_moisture_model_improved,
+  future_preds_df
+)
+```
+
+```{r}
+future_preds_rolling_1 <- results_predictions_rolling_1$preds
+future_preds_rolling_4 <- results_predictions_rolling_4$preds
+future_preds_rolling_16 <- results_predictions_rolling_16$preds
+future_preds_rolling_96 <- results_predictions_rolling_96$preds
+future_preds_baseline <- results_prediction_baseline$preds
+future_preds_overfitted <- results_prediction_overfitted$preds
+future_preds_improved <- results_prediction_improved$preds
+```
+
+```{r}
+# Combining prediction results together to plot them against each other
+combine_preds <- function(df, model_name) {
+  df %>%
+    select(timestamp, soil_moisture,
+           preds, lower, upper) %>%
+    mutate(model = model_name)
+}
+
+predictions_all <- bind_rows(
+  combine_preds(results_predictions_rolling_1$preds,  "Lag 1"),
+  combine_preds(results_predictions_rolling_4$preds,  "Lag 4"),
+  combine_preds(results_predictions_rolling_16$preds, "Lag 16"),
+  combine_preds(results_predictions_rolling_96$preds, "Lag 96"),
+  combine_preds(results_prediction_baseline$preds,    "Baseline"),
+  combine_preds(results_prediction_overfitted$preds,    "Overfitted"),
+  combine_preds(results_prediction_improved$preds,    "Improved")
+  )
+```
+
+```{r}
+# Graph representing predictions against Observed Values for each model
+ggplot(predictions_all, aes(x = timestamp)) +
+
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = model), alpha = 0.5) +
+  geom_line(aes(y = soil_moisture), colour = "black", linewidth = 0.9) +
+  geom_line(aes(y = preds, colour = model), linewidth = 0.9) +
+
+  labs(
+    title = "Rolling Forecast Comparison Across All Models",
+    x = "Time",
+    y = "Soil Moisture"
+    # colour = "Model",
+    # fill = "95% CI"
+  ) +
+  theme_minimal() +
+  facet_wrap(~ model, scales = "free_y", ncol = 1) +
+  theme(legend.position = "None", 
+      plot.title = element_text(size = 22, hjust = 0.5))
+```
+
+```{r}
+# Graph representing predictions against Observed Values for best model
+ggplot(combine_preds(results_predictions_rolling_4$preds,  "Lag 4"), aes(x = timestamp)) +
+
+  geom_line(aes(y = soil_moisture, colour = "Observed"), linewidth = 0.9) +
+  geom_line(aes(y = preds, colour = "Predicted"), linewidth = 0.9) +
+    # --- Colours ---
+  scale_colour_manual(values = c(
+    "Observed"             = "black",
+    "Predicted"   = "blue"
+  )) +
+
+  labs(
+    title = "Observed vs Rolling Forecast for Lag 4 Model",
+    x = "Time",
+    y = "Soil Moisture",
+    colour = "Model",
+  ) +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(size = 22, hjust = 0.5))
+```
+
+```{r}
+# Retrieving RMSE window values for each model
+combine_rmse <- function(res, model_name) {
+  res$rmse_windows %>%
+    mutate(model = model_name)
+}
+
+rmse_all <- bind_rows(
+  combine_rmse(results_predictions_rolling_1,  "Lag 1"),
+  combine_rmse(results_predictions_rolling_4,  "Lag 4"),
+  combine_rmse(results_predictions_rolling_16, "Lag 16"),
+  combine_rmse(results_predictions_rolling_96, "Lag 96"),
+  combine_rmse(results_prediction_baseline,    "Baseline"),
+  combine_rmse(results_prediction_overfitted,    "Overfitted"),
+  combine_rmse(results_prediction_improved,    "Improved")
+)
+```
+
+```{r}
+# Plot of RMSE across each window for every model
+ggplot(rmse_all, aes(x = start_ts, y = rmse_window, colour = model)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "Window-by-Window RMSE Across Models",
+    x = "Window ID",
+    y = "RMSE"
+  )
+```
+
+```{r}
+# Plot of Cumulative RMSE across each window for every model
+ggplot(rmse_all, aes(x = start_ts, y = rmse_cumulative, colour = model)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "Cumulative RMSE Across Models",
+    x = "Window ID",
+    y = "Cumulative RMSE"
+  )+
+  theme(
+      plot.title = element_text(size = 22, hjust = 0.5))
+```
+
+```{r}
+# Plot of Cumulative RMSE across each window for best model
+ggplot(combine_rmse(results_predictions_rolling_1,  "Lag 1"), aes(x = start_ts, y = rmse_cumulative)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "Cumulative RMSE for Lag 1 Model",
+    x = "Date",
+    y = "Cumulative RMSE"
+  )+
+  theme(
+      plot.title = element_text(size = 22, hjust = 0.5))
+```
+
+```{r}
+# Create combined metrics dataframe for R-squared visualization
+combine_metrics <- function(res, model_name) {
+  res$rmse_windows %>%
+    mutate(model = model_name)
+}
+
+metrics_all <- bind_rows(
+  combine_metrics(results_predictions_rolling_1,  "Lag 1"),
+  combine_metrics(results_predictions_rolling_4,  "Lag 4"),
+  combine_metrics(results_predictions_rolling_16, "Lag 16"),
+  combine_metrics(results_predictions_rolling_96, "Lag 96"),
+  combine_metrics(results_prediction_baseline,    "Baseline"),
+  combine_metrics(results_prediction_overfitted,    "Overfitted"),
+  combine_metrics(results_prediction_improved,    "Improved")
+)
+```
+
+```{r}
+# Plot of Cumulative R2 across each window for every model
+ggplot(metrics_all, aes(x = start_ts, y = r2_cumulative, colour = model)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "Cumulative R-squared Across Models",
+    x = "Date",
+    y = "Cumulative R-squared"
+  )+
+  theme(
+      plot.title = element_text(size = 22, hjust = 0.5))
+```
+
+```{r}
+# Plot of Cumulative R2 across each window for best model
+plot_df_r2 <- combine_metrics(results_predictions_rolling_1,  "Lag 1")
+
+ggplot(plot_df_r2[50:nrow(plot_df_r2),], aes(x = start_ts, y = r2_cumulative)) +
+  geom_line() +
+  geom_point(size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "Cumulative R-squared for Lag 1 Model",
+    x = "Date",
+    y = "Cumulative R-squared"
+  ) +
+  theme(
+      plot.title = element_text(size = 22, hjust = 0.5))
+```
+
+```{r}
+# Function which ranks the models based on Metrics
+create_model_ranking <- function(results_list) {
+  
+  ranking <- lapply(names(results_list), function(model_name) {
+    df <- results_list[[model_name]]$rmse_windows
+    
+    data.frame(
+      model = model_name,
+      n_windows = nrow(df),
+      min_cumulative_rmse = min(df$rmse_cumulative, na.rm = TRUE),
+      median_cumulative_rmse = median(df$rmse_cumulative, na.rm = TRUE),
+      mean_cumulative_rmse = mean(df$rmse_cumulative, na.rm = TRUE),
+      final_cumulative_rmse = tail(df$rmse_cumulative, 1),
+      max_cumulative_r2 = max(df$r2_cumulative, na.rm = TRUE),
+      median_cumulative_r2 = median(df$r2_cumulative, na.rm = TRUE),
+      mean_cumulative_r2 = mean(df$r2_cumulative, na.rm = TRUE),
+      final_cumulative_r2 = tail(df$r2_cumulative, 1)
+    )
+  }) %>% 
+    bind_rows() %>%
+    arrange(final_cumulative_rmse)
+  
+  return(ranking)
+}
+```
+
+```{r}
+# Table comparing Model Performance
+results_list <- list(
+  lag1 = results_predictions_rolling_1,
+  lag4 = results_predictions_rolling_4,
+  lag16 = results_predictions_rolling_16,
+  lag96 = results_predictions_rolling_96,
+  baseline = results_prediction_baseline,
+  overfitted = results_prediction_overfitted,
+  improved = results_prediction_improved
+)
+
+ranking_table <- create_model_ranking(results_list)
+ranking_table %>%
+  gt() %>%
+  fmt_number(columns = 3:10, decimals = 3) %>%
+  tab_header(title = "Model Rolling Prediction Performance Ranking")
+```
+
+```{r}
+# Daily Maximum Metrics for Plots
+daily_min_rmse <- rmse_all %>%
+  mutate(
+    date = as.Date(start_ts)
+  ) %>%
+  group_by(date, model) %>%
+  summarise(
+    max_cumulative_rmse = min(rmse_cumulative, na.rm = TRUE),
+    max_cumulative_r2 = max(r2_cumulative, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+daily_min_rmse %>%
+  filter(model == "Lag 1") %>%
+  select(date, max_cumulative_rmse, max_cumulative_r2) %>%
+  gt() %>%
+  fmt_number(columns = 2:3, decimals = 4) %>%
+  tab_header(title = "Lag 1 Model Metrics over Days")
+```
+
+
+### CIs for Rolling Predictions
+
+```{r}
+# Create a self-contained dataset with predicted lags for CI analysis
+prepare_ci_dataset <- function(future_preds_df, model) {
+
+  # Create a copy to work with
+  ci_dataset <- future_preds_df %>% select(-preds, -lower, -upper) 
+
+  # Get the lag variable name used by this model
+  model_formula <- formula(model)
+  lag_vars <- grep("sm_lag", all.vars(model_formula), value = TRUE)
+
+  if (length(lag_vars) == 0) {
+    message("No lag variables found in model formula. Using original data.")
+    return(future_preds_df)
+  }
+
+  # For each lag variable, use the predicted values shifted appropriately
+  for (lag_var in lag_vars) {
+    # Extract the lag number (e.g., "sm_lag4" -> 4)
+    lag_number <- as.numeric(gsub("sm_lag", "", lag_var))
+
+    # Create the lag variable using predicted values
+    ci_dataset[[lag_var]] <- lag(future_preds_df$preds, n = lag_number)
+
+  # Add back the original soil_moisture values for CI validation
+  ci_dataset$soil_moisture <- future_preds_df$soil_moisture
+
+  return(ci_dataset)
+}}
+
+CI_df <- prepare_ci_dataset(future_preds_rolling_1, soil_moisture_model_lag1)
+```
+
+```{r}
+# CI for Lag 1 Model Hourly Rolling Predictions
+ci_by_hour <- compute_ci_by_group(
+  model = soil_moisture_model_lag1,
+  data = CI_df,
+  group_var = hour,
+  n = 1000)
+
+ci_by_hour$hour <- ci_by_hour$group
+
+observed_by_hour <- CI_df %>%
+  group_by(hour) %>%
+  summarise(
+    soil_moisture_mean = mean(soil_moisture, na.rm = TRUE)
+  )
+
+ci_plot_hour <- ci_by_hour %>%
+  left_join(observed_by_hour, by = "hour")
+```
+
+```{r}
+ggplot(ci_plot_hour, aes(x = as.factor(hour))) +
+  
+  geom_point(aes(y = mean, colour = "Predicted"), size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, colour = "Predicted"),
+                width = 1) +
+  
+  geom_point(aes(y = soil_moisture_mean, colour = "Observed"),
+             size = 3) +
+  geom_line(aes(y = soil_moisture_mean, colour = "Observed", group = 1),
+            linewidth = 0.8) +
+  
+  scale_colour_manual(values = c(
+    "Predicted" = "blue",
+    "Observed"  = "black"
+  )) +
+  
+  labs(
+    title = "Predicted vs Observed Hourly Average Soil Moisture",
+    x = "Hour of the Day",
+    y = "Soil Moisture",
+    colour = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 22, hjust = 0.5),
+    axis.text.x = element_text(angle = 60, hjust = 1)
+  ) +
+  scale_y_continuous(labels = scales::comma)
+```
+
+```{r}
+# CI for Lag 1 Model Daily Rolling Predictions
+CI_df$date <- as.Date(CI_df$timestamp)
+
+ci_by_date <- compute_ci_by_group(
+  model = soil_moisture_model_lag1,
+  data = CI_df,
+  group_var = date,
+  n = 1000)
+
+ci_by_date$date <- as.Date(ci_by_date$group)
+
+observed_by_date <- CI_df %>%
+  mutate(date = as.Date(timestamp)) %>%
+  group_by(date) %>%
+  summarise(
+    soil_moisture_mean = mean(soil_moisture, na.rm = TRUE)
+  )
+
+ci_plot_df <- ci_by_date %>%
+  left_join(observed_by_date, by = "date")
+```
+
+```{r}
+ggplot(ci_plot_df, aes(x = factor(date))) +
+  
+  geom_point(aes(y = mean, colour = "Predicted"), size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper, colour = "Predicted"),
+                width = 0.2) +
+  
+  geom_point(aes(y = soil_moisture_mean, colour = "Observed"),
+             size = 3) +
+  geom_line(aes(y = soil_moisture_mean, colour = "Observed", group = 1),
+            linewidth = 0.8) +
+  
+  scale_colour_manual(values = c(
+    "Predicted" = "blue",
+    "Observed"  = "black"
+  )) +
+  
+  labs(
+    title = "Predicted vs Observed Daily Average Soil Moisture",
+    x = "Date",
+    y = "Soil Moisture",
+    colour = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 22, hjust = 0.5),
+    axis.text.x = element_text(angle = 60, hjust = 1)
+  ) +
+  scale_y_continuous(labels = scales::comma)
+```

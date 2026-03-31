@@ -3,4 +3,4 @@ iot_devices.db
 data/*.csv
 __pycache__/
 .DS_Store
-
+maps/*.html
